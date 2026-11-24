@@ -17,3 +17,13 @@
     <% }) %>
   </div>
 </div>
+
+<script>
+  window.addEventListener("pageshow", function () {
+    document.querySelectorAll('input[name="seats"]').forEach(seat => {
+      if (!seat.disabled) {
+        seat.checked = false;
+      }
+    });
+  });
+</script>

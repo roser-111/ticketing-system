@@ -1,5 +1,13 @@
 const express = require("express");
 const pool = require("./db");
+require("dotenv").config();
+
+const { sendOrderTickets } = require("./services/emailService");
+const {
+  createTicketToken,
+  hashTicketToken,
+  generateOrderPDF
+} = require("./services/ticketService");
 
 const app = express();
 
@@ -174,107 +182,231 @@ app.post("/events/:id/checkout", requireLogin, async (req, res) => {
   res.render("checkout", { event, seats: seatsResult.rows, floor, total });
 });
 
+
+
 app.post("/events/:id/book", requireLogin, async (req, res) => {
   const seatIds = toSeatIds(req.body);
   const floor = toFloorCount(req.body);
-  if (seatIds.length === 0 && floor === 0)
+
+  if (seatIds.length === 0 && floor === 0) {
     return res.redirect(`/events/${req.params.id}/seats`);
+  }
 
-  const eventResult = await pool.query("SELECT * FROM events WHERE id = $1", [
-    req.params.id,
-  ]);
-  if (eventResult.rows.length === 0)
+  const eventResult = await pool.query(
+    "SELECT * FROM events WHERE id = $1",
+    [req.params.id]
+  );
+
+  if (eventResult.rows.length === 0) {
     return res.status(404).send("Event not found");
-  const event = eventResult.rows[0];
+  }
 
+  const event = eventResult.rows[0];
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
+    // Pobieramy wolne miejsca na płycie
     if (floor > 0) {
       const free = await client.query(
         `SELECT s.id FROM seats s
-         WHERE s.arena_id = $1 AND s.section = 'FLOOR'
-           AND NOT EXISTS (SELECT 1 FROM order_items oi
-                           WHERE oi.seat_id = s.id AND oi.event_id = $2)
-         ORDER BY s.id LIMIT $3`,
-        [event.arena_id, req.params.id, floor],
+         WHERE s.arena_id = $1
+           AND s.section = 'FLOOR'
+           AND NOT EXISTS (
+             SELECT 1 FROM order_items oi
+             WHERE oi.seat_id = s.id
+               AND oi.event_id = $2
+           )
+         ORDER BY s.id
+         LIMIT $3`,
+        [event.arena_id, req.params.id, floor]
       );
+
       if (free.rows.length < floor) {
         await client.query("ROLLBACK");
+
         return res.status(409).send(
-          `Sorry, not enough floor tickets left. <a href="/events/${req.params.id}/seats">Choose again</a>`,
+          `Sorry, not enough floor tickets left.
+           <a href="/events/${req.params.id}/seats">Choose again</a>`
         );
       }
+
       free.rows.forEach((r) => seatIds.push(r.id));
     }
 
-    const seats = (await getSeatPrices(client, req.params.id, seatIds)).rows;
-    const total = seats.reduce((sum, s) => sum + Number(s.price), 0).toFixed(2);
-    const order = await client.query(
-      "INSERT INTO orders (user_id, total) VALUES ($1, $2) RETURNING id",
-      [req.session.user.id, total],
-    );
-    for (const seat of seats) {
-      await client.query(
-        "INSERT INTO order_items (order_id, event_id, seat_id, price) VALUES ($1, $2, $3, $4)",
-        [order.rows[0].id, req.params.id, seat.id, seat.price],
+    // Pobieramy miejsca i ich ceny
+    const seats = (
+      await getSeatPrices(client, req.params.id, seatIds)
+    ).rows;
+
+    if (seats.length !== seatIds.length) {
+      await client.query("ROLLBACK");
+
+      return res.status(409).send(
+        `Some selected seats are unavailable.
+         <a href="/events/${req.params.id}/seats">Choose again</a>`
       );
     }
+
+    const total = seats
+      .reduce((sum, s) => sum + Number(s.price), 0)
+      .toFixed(2);
+
+    // Tworzymy zamówienie
+    const order = await client.query(
+      `INSERT INTO orders (user_id, total)
+       VALUES ($1, $2)
+       RETURNING id`,
+      [req.session.user.id, total]
+    );
+
+    const orderId = order.rows[0].id;
+
+    // Tworzymy bilety dla wszystkich wybranych miejsc
+    for (const seat of seats) {
+      const item = await client.query(
+        `INSERT INTO order_items
+         (order_id, event_id, seat_id, price)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id`,
+        [orderId, req.params.id, seat.id, seat.price]
+      );
+
+      const orderItemId = item.rows[0].id;
+
+      const ticketSequence = await client.query(
+        `SELECT nextval(
+          pg_get_serial_sequence('tickets', 'id')
+        ) AS id`
+      );
+
+      const ticketId = ticketSequence.rows[0].id;
+
+      const token = createTicketToken(ticketId);
+      const tokenHash = hashTicketToken(token);
+
+      await client.query(
+        `INSERT INTO tickets
+         (id, order_item_id, qr_token_hash)
+         VALUES ($1, $2, $3)`,
+        [ticketId, orderItemId, tokenHash]
+      );
+    }
+
+    // Zapisujemy zamówienie w bazie
     await client.query("COMMIT");
-    res.redirect("/orders");
+
+    // Wysyłka e-maila odbywa się PO zatwierdzeniu zakupu.
+    // Błąd wysyłki nie anuluje zamówienia.
+    try {
+      const userResult = await pool.query(
+        "SELECT email FROM users WHERE id = $1",
+        [req.session.user.id]
+      );
+
+      const ticketsResult = await pool.query(
+        `SELECT
+           t.id AS ticket_id,
+           e.title AS event_title,
+           e.event_date,
+           a.name AS arena_name,
+           s.section,
+           s.row_num,
+           s.seat_number,
+           oi.price
+         FROM orders o
+         JOIN order_items oi ON oi.order_id = o.id
+         JOIN tickets t ON t.order_item_id = oi.id
+         JOIN events e ON e.id = oi.event_id
+         JOIN arenas a ON a.id = e.arena_id
+         JOIN seats s ON s.id = oi.seat_id
+         WHERE o.id = $1
+           AND o.user_id = $2
+           AND o.status = 'paid'
+         ORDER BY s.section, s.row_num, s.seat_number`,
+        [orderId, req.session.user.id]
+      );
+
+      if (userResult.rows.length === 0 || !userResult.rows[0].email) {
+        throw new Error("Nie znaleziono adresu e-mail użytkownika.");
+      }
+
+      if (ticketsResult.rows.length === 0) {
+        throw new Error("Nie znaleziono biletów do wysłania.");
+      }
+
+      // Generujemy jeden PDF ze wszystkimi biletami
+      const pdfBuffer = await generateOrderPDF(ticketsResult.rows);
+
+      // Wysyłamy PDF na adres e-mail kupującego
+      await sendOrderTickets(
+        userResult.rows[0].email,
+        orderId,
+        pdfBuffer
+      );
+
+      console.log(`Bilety z zamówienia #${orderId} wysłane e-mailem.`);
+
+    } catch (emailError) {
+      console.error(
+        `Zamówienie #${orderId} zapisane, ale e-mail nie został wysłany:`,
+        emailError
+      );
+    }
+
+    return res.redirect("/orders");
+
   } catch (err) {
     await client.query("ROLLBACK");
+
     if (err.code === "23505") {
-      return res
-        .status(409)
-        .send(
-          `Sorry, one of those seats was just taken. <a href="/events/${req.params.id}/seats">Choose again</a>`,
-        );
+      return res.status(409).send(
+        `Sorry, one of those seats was just taken.
+         <a href="/events/${req.params.id}/seats">Choose again</a>`
+      );
     }
-    throw err;
+
+    console.error("Booking error:", err);
+
+    return res.status(500).send(
+      "An error occurred while creating your order."
+    );
+
   } finally {
     client.release();
   }
 });
 
+
+
+
+// Wyświetlanie zamówień użytkownika
 app.get("/orders", requireLogin, async (req, res) => {
   const result = await pool.query(
-    `SELECT o.id AS order_id, o.total, o.created_at,
-            e.title, e.event_date,
-            s.section, s.row_num, s.seat_number
+    `SELECT
+       o.id AS order_id,
+       o.total,
+       o.created_at,
+       e.title,
+       e.event_date,
+       s.section,
+       s.row_num,
+       s.seat_number
      FROM orders o
      JOIN order_items oi ON oi.order_id = o.id
      JOIN events e ON e.id = oi.event_id
      JOIN seats s ON s.id = oi.seat_id
      WHERE o.user_id = $1
-     ORDER BY o.created_at DESC, s.section, s.row_num, s.seat_number`,
-    [req.session.user.id],
+     ORDER BY o.created_at DESC,
+              s.section,
+              s.row_num,
+              s.seat_number`,
+    [req.session.user.id]
   );
 
-  app.post("/orders/:id/cancel", requireLogin, async (req, res) => {
-  const result = await pool.query(
-    `DELETE FROM orders o
-     WHERE o.id = $1 AND o.user_id = $2
-       AND EXISTS (
-         SELECT 1 FROM order_items oi
-         JOIN events e ON e.id = oi.event_id
-         WHERE oi.order_id = o.id AND e.event_date > now() + interval '7 days'
-       )
-     RETURNING o.id`,
-    [req.params.id, req.session.user.id],
-  );
-  if (result.rowCount === 0) {
-    return res.status(400).render("error", {
-      status: 400,
-      message: "This order can't be cancelled",
-    });
-  }
-  res.redirect("/orders");
-});
-
-  // group rows by order
   const orders = {};
+
   result.rows.forEach((row) => {
     orders[row.order_id] ??= {
       id: row.order_id,
@@ -282,14 +414,117 @@ app.get("/orders", requireLogin, async (req, res) => {
       created_at: row.created_at,
       title: row.title,
       event_date: row.event_date,
-      can_cancel: row.event_date.getTime() - Date.now() > 7 * 24 * 60 * 60 * 1000,
-      seats: [],
+      can_cancel:
+        row.event_date.getTime() - Date.now() >
+        7 * 24 * 60 * 60 * 1000,
+      seats: []
     };
+
     orders[row.order_id].seats.push(row);
   });
 
-  res.render("orders", { orders: Object.values(orders).reverse() });
+  res.render("orders", {
+    orders: Object.values(orders).reverse()
+  });
 });
+
+
+// Pobieranie jednego PDF ze wszystkimi biletami zamówienia
+app.get(
+  "/orders/:id/pdf",
+  requireLogin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT
+           t.id AS ticket_id,
+           e.title AS event_title,
+           e.event_date,
+           a.name AS arena_name,
+           s.section,
+           s.row_num,
+           s.seat_number,
+           oi.price
+         FROM orders o
+         JOIN order_items oi ON oi.order_id = o.id
+         JOIN tickets t ON t.order_item_id = oi.id
+         JOIN events e ON e.id = oi.event_id
+         JOIN arenas a ON a.id = e.arena_id
+         JOIN seats s ON s.id = oi.seat_id
+         WHERE o.id = $1
+           AND o.user_id = $2
+           AND o.status = 'paid'
+         ORDER BY s.section, s.row_num, s.seat_number`,
+        [req.params.id, req.session.user.id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).send(
+          "Order or tickets not found."
+        );
+      }
+
+      const pdf = await generateOrderPDF(result.rows);
+
+      res.setHeader(
+        "Content-Type",
+        "application/pdf"
+      );
+
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="bilety-zamowienie-${req.params.id}.pdf"`
+      );
+
+      res.setHeader(
+        "Content-Length",
+        pdf.length
+      );
+
+      res.send(pdf);
+
+    } catch (err) {
+      console.error("PDF generation error:", err);
+
+      res.status(500).send(
+        "Could not generate ticket PDF."
+      );
+    }
+  }
+);
+
+
+// Anulowanie zamówienia
+app.post(
+  "/orders/:id/cancel",
+  requireLogin,
+  async (req, res) => {
+    const result = await pool.query(
+      `DELETE FROM orders o
+       WHERE o.id = $1
+         AND o.user_id = $2
+         AND EXISTS (
+           SELECT 1
+           FROM order_items oi
+           JOIN events e ON e.id = oi.event_id
+           WHERE oi.order_id = o.id
+             AND e.event_date > now() + interval '7 days'
+         )
+       RETURNING o.id`,
+      [req.params.id, req.session.user.id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(400).render("error", {
+        status: 400,
+        message: "This order can't be cancelled"
+      });
+    }
+
+    res.redirect("/orders");
+  }
+);
+
 
 function requireAdmin(req, res, next) {
   if (!req.session.user) return res.redirect("/login");
